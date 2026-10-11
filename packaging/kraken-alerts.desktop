@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Alertes Kraken
+GenericName=Veille de marché
+Comment=Prix, type de marché et biais court ou long terme
+Exec=@BIN@ panel
+Icon=@ICON@
+Terminal=false
+Categories=Office;Finance;
+Keywords=crypto;bitcoin;kraken;spot;prix;
+StartupNotify=true
+StartupWMClass=kraken-alerts

@@ -1,0 +1,16 @@
+[Unit]
+Description=Alertes de prix et de biais Kraken
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/kraken-alerts run
+Restart=on-failure
+RestartSec=15
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target
