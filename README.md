@@ -18,13 +18,19 @@ Aucun ordre n'est passé. Les lectures long et short sont des règles mécanique
 systemctl --user enable --now kraken-alerts
 ```
 
-Le panneau **Alertes Kraken** apparaît dans le menu, catégorie Bureautique. Le fermer n'arrête pas les alertes.
+Le panneau **Alertes Kraken** apparaît dans le menu, catégorie Bureautique. Le fermer n'arrête pas les alertes. L'icône dans la barre se lance avec :
+
+```bash
+systemctl --user enable --now kraken-alerts-tray
+```
 
 ## Configuration
 
 Le fichier personnel est `~/.config/kraken-alerts/config.toml`. `config.toml` dans ce dépôt sert de modèle et n'est copié que s'il n'existe pas encore.
 
-`market` peut valoir `Spot`, `Futures`, `Forex` ou `Action tokenisée`.
+`market` peut valoir `Spot`, `Futures`, `Forex` ou `Action tokenisée`. Un perpétuel utilise `engine = "futures"` (par exemple `PF_XBTUSD`). Une action tokenisée garde la casse du symbole, comme `AAPLx/USD`, avec `asset_class = "tokenized_asset"`.
+
+`below` et `above` sont des seuils franchis une seule fois. Entre `quiet_start` et `quiet_end`, les notifications sont retenues. À `digest_hour`, un seul résumé part.
 
 Après une modification :
 

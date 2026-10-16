@@ -14,7 +14,7 @@ mkdir -p \
   "$HOME/.local/share/icons/hicolor/64x64/apps" \
   "$HOME/.local/share/icons/hicolor/128x128/apps"
 
-cp "$ROOT/kraken_alerts.py" "$ROOT/panel.py" "$HOME/.local/share/kraken-alerts/"
+cp "$ROOT/kraken_alerts.py" "$ROOT/panel.py" "$ROOT/tray.py" "$HOME/.local/share/kraken-alerts/"
 chmod 755 "$HOME/.local/share/kraken-alerts/kraken_alerts.py"
 
 cp "$ROOT/icons/hicolor/scalable/apps/kraken-alerts.svg" \
@@ -28,6 +28,8 @@ cp "$ROOT/icons/hicolor/128x128/apps/kraken-alerts.png" \
 
 cp "$ROOT/packaging/kraken-alerts.service" \
   "$HOME/.config/systemd/user/kraken-alerts.service"
+cp "$ROOT/packaging/kraken-alerts-tray.service" \
+  "$HOME/.config/systemd/user/kraken-alerts-tray.service"
 
 if [ ! -f "$HOME/.config/kraken-alerts/config.toml" ]; then
   cp "$ROOT/config.toml" "$HOME/.config/kraken-alerts/config.toml"

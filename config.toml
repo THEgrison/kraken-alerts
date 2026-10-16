@@ -7,30 +7,44 @@ long_refresh_seconds = 1800
 urgent_move_pct = 4.0
 price_cooldown_seconds = 1200
 bias_cooldown_seconds = 7200
+quiet_start = "23:00"
+quiet_end = "08:00"
+digest_hour = "08:00"
 
 # market : Spot, Futures, Forex, Action tokenisée
+# engine : spot (défaut) ou futures
+# below / above : seuil franchi une seule fois
 
 [[pair]]
-symbol = "BTCEUR"
+symbol = "BTCUSD"
 label = "BTC"
 market = "Spot"
 price_move_pct = 1.2
+below = [70000]
 
 [[pair]]
-symbol = "ETHEUR"
+symbol = "ETHUSD"
 label = "ETH"
 market = "Spot"
 price_move_pct = 1.5
 
 [[pair]]
-symbol = "SOLEUR"
+symbol = "SOLUSD"
 label = "SOL"
 market = "Spot"
 price_move_pct = 2.0
+above = [120]
 
-# Exemple d'action tokenisée Kraken (xStocks), si le pair existe :
-# [[pair]]
-# symbol = "AAPLxUSD"
-# label = "AAPL"
-# asset_class = "tokenized_asset"
-# price_move_pct = 1.5
+[[pair]]
+symbol = "PF_XBTUSD"
+label = "BTC perp"
+market = "Futures"
+engine = "futures"
+price_move_pct = 1.2
+
+[[pair]]
+symbol = "AAPLx/USD"
+label = "AAPL"
+market = "Action tokenisée"
+asset_class = "tokenized_asset"
+price_move_pct = 1.5

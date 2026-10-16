@@ -16,7 +16,9 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 APP = "Kraken alertes"
@@ -33,6 +35,8 @@ STATE_PATH = Path(
 )
 HISTORY_PATH = STATE_PATH.with_name("alerts.log")
 SNAPSHOT_PATH = STATE_PATH.with_name("snapshot.json")
+UNREAD_PATH = STATE_PATH.with_name("unread")
+FUTURES_CHARTS = "https://futures.kraken.com/api/charts/v1/trade"
 
 RULES = """\
 Règles utilisées (mécaniques, pas un conseil)
@@ -40,6 +44,11 @@ Règles utilisées (mécaniques, pas un conseil)
 Prix
   Alerte si le cours s'écarte du dernier point signalé de plus que le seuil
   du pair (price_move_pct dans la config).
+  Un seuil below ou above ne part qu'une fois, au franchissement.
+
+Heures silencieuses
+  Entre quiet_start et quiet_end, les bulles sont retenues.
+  À digest_hour, une seule notification résume la nuit et les cours.
 
 Court terme — chandeliers de 15 minutes
   RSI 14, moyenne mobile 8 et moyenne mobile 21, sur les bougies clôturées.
@@ -67,12 +76,17 @@ class PairConfig:
     label: str
     asset_class: str | None = None
     market: str | None = None
+    engine: str = "spot"
     price_move_pct: float = 1.5
+    below: list[float] = field(default_factory=list)
+    above: list[float] = field(default_factory=list)
 
 
 def market_name(pair: PairConfig) -> str:
     if pair.market:
         return pair.market
+    if pair.engine == "futures":
+        return "Futures"
     return {
         "tokenized_asset": "Action tokenisée",
         "forex": "Forex",
@@ -89,6 +103,9 @@ class Settings:
     urgent_move_pct: float = 4.0
     price_cooldown_seconds: int = 1200
     bias_cooldown_seconds: int = 7200
+    quiet_start: int | None = 23 * 60
+    quiet_end: int | None = 8 * 60
+    digest_minute: int | None = 8 * 60
     pairs: list[PairConfig] = field(default_factory=list)
 
 
@@ -112,14 +129,20 @@ long_refresh_seconds = 1800
 urgent_move_pct = 4.0
 price_cooldown_seconds = 1200
 bias_cooldown_seconds = 7200
+quiet_start = "23:00"
+quiet_end = "08:00"
+digest_hour = "08:00"
 
 # market : Spot, Futures, Forex, Action tokenisée
+# engine : spot (défaut) ou futures
+# below / above : seuil franchi une seule fois
 
 [[pair]]
 symbol = "BTCUSD"
 label = "BTC"
 market = "Spot"
 price_move_pct = 1.2
+below = [70000]
 
 [[pair]]
 symbol = "ETHUSD"
@@ -132,14 +155,57 @@ symbol = "SOLUSD"
 label = "SOL"
 market = "Spot"
 price_move_pct = 2.0
+above = [120]
 
-# Exemple d'action tokenisée Kraken (xStocks), si le pair existe sur ton compte :
-# [[pair]]
-# symbol = "AAPLxUSD"
-# label = "AAPL"
-# asset_class = "tokenized_asset"
-# price_move_pct = 1.5
+[[pair]]
+symbol = "PF_XBTUSD"
+label = "BTC perp"
+market = "Futures"
+engine = "futures"
+price_move_pct = 1.2
+
+[[pair]]
+symbol = "AAPLx/USD"
+label = "AAPL"
+market = "Action tokenisée"
+asset_class = "tokenized_asset"
+price_move_pct = 1.5
 """
+
+
+def clock_minutes(value: str | None, default: int | None) -> int | None:
+    if value is None or value == "":
+        return default
+    hour, minute = str(value).split(":", 1)
+    return int(hour) * 60 + int(minute)
+
+
+def number_list(value) -> list[float]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, str):
+        parts = value.replace(";", ",").split(",")
+        return [float(part) for part in parts if part.strip()]
+    return [float(item) for item in value]
+
+
+def keep_symbol(value: str) -> str:
+    text = value.strip()
+    if any(char.islower() for char in text):
+        return text
+    return text.upper()
+
+
+def pair_engine(item: dict, symbol: str) -> str:
+    engine = str(item.get("engine") or "").lower()
+    if engine in {"futures", "spot"}:
+        return engine
+    market = str(item.get("market") or "").lower()
+    if market == "futures" or symbol.startswith(("PF_", "PI_", "FI_")):
+        return "futures"
+    return "spot"
 
 
 def load_settings() -> Settings:
@@ -151,14 +217,17 @@ def load_settings() -> Settings:
     kraken = raw.get("kraken_bin") or shutil.which("kraken") or str(HOME / ".cargo/bin/kraken")
     pairs = []
     for item in raw.get("pair", []):
-        symbol = str(item["symbol"]).upper()
+        symbol = keep_symbol(str(item["symbol"]))
         pairs.append(
             PairConfig(
                 symbol=symbol,
                 label=str(item.get("label") or symbol),
                 asset_class=item.get("asset_class") or None,
                 market=str(item["market"]) if item.get("market") else None,
+                engine=pair_engine(item, symbol),
                 price_move_pct=float(item.get("price_move_pct", raw.get("price_move_pct", 1.5))),
+                below=number_list(item.get("below")),
+                above=number_list(item.get("above")),
             )
         )
     if not pairs:
@@ -171,8 +240,33 @@ def load_settings() -> Settings:
         urgent_move_pct=float(raw.get("urgent_move_pct", 4.0)),
         price_cooldown_seconds=int(raw.get("price_cooldown_seconds", 1200)),
         bias_cooldown_seconds=int(raw.get("bias_cooldown_seconds", 7200)),
+        quiet_start=clock_minutes(raw.get("quiet_start"), 23 * 60),
+        quiet_end=clock_minutes(raw.get("quiet_end"), 8 * 60),
+        digest_minute=clock_minutes(raw.get("digest_hour"), 8 * 60),
         pairs=pairs,
     )
+
+
+def minutes_now(moment: datetime | None = None) -> int:
+    moment = moment or datetime.now()
+    return moment.hour * 60 + moment.minute
+
+
+def in_quiet(settings: Settings, moment: datetime | None = None) -> bool:
+    start = settings.quiet_start
+    end = settings.quiet_end
+    if start is None or end is None or start == end:
+        return False
+    now = minutes_now(moment)
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end
+
+
+def clock_label(minutes: int | None) -> str:
+    if minutes is None:
+        return ""
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def kraken_json(settings: Settings, args: list[str], timeout: int = 40) -> dict:
@@ -192,6 +286,8 @@ def kraken_json(settings: Settings, args: list[str], timeout: int = 40) -> dict:
 
 
 def fetch_ticker(settings: Settings, pair: PairConfig) -> dict:
+    if pair.engine == "futures":
+        return fetch_futures_ticker(settings, pair)
     args = ["ticker", pair.symbol]
     if pair.asset_class:
         args += ["--asset-class", pair.asset_class]
@@ -201,7 +297,23 @@ def fetch_ticker(settings: Settings, pair: PairConfig) -> dict:
     return next(iter(data.values()))
 
 
+def fetch_futures_ticker(settings: Settings, pair: PairConfig) -> dict:
+    data = kraken_json(settings, ["futures", "ticker", pair.symbol])
+    ticker = data.get("ticker") or {}
+    if "last" not in ticker:
+        raise RuntimeError("ticker futures vide")
+    return {
+        "last_price": float(ticker["last"]),
+        "open": float(ticker.get("open24h") or 0),
+        "high_24h": float(ticker.get("high24h") or 0),
+        "low_24h": float(ticker.get("low24h") or 0),
+    }
+
+
 def fetch_ohlc(settings: Settings, pair: PairConfig, interval: int) -> list[dict]:
+    if pair.engine == "futures":
+        mapped = {15: "15m", 60: "1h", 1440: "1d"}.get(interval, "15m")
+        return fetch_futures_candles(pair.symbol, mapped)
     args = ["ohlc", pair.symbol, "--interval", str(interval)]
     if pair.asset_class:
         args += ["--asset-class", pair.asset_class]
@@ -210,6 +322,42 @@ def fetch_ohlc(settings: Settings, pair: PairConfig, interval: int) -> list[dict
     if len(candles) >= 2:
         candles = candles[:-1]
     return candles
+
+
+def fetch_futures_candles(symbol: str, interval: str) -> list[dict]:
+    request = urllib.request.Request(
+        f"{FUTURES_CHARTS}/{symbol}/{interval}",
+        headers={"User-Agent": "kraken-alerts"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+    except Exception as exc:
+        raise RuntimeError(f"chandeliers futures indisponibles ({exc})") from exc
+    candles = []
+    for candle in data.get("candles") or []:
+        candles.append(
+            {
+                "time": int(candle["time"]) // 1000,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+                "volume": float(candle["volume"]),
+            }
+        )
+    if len(candles) >= 2:
+        candles = candles[:-1]
+    return candles
+
+
+def sparkline(candles: list[dict]) -> list[float]:
+    closes = [float(candle["close"]) for candle in candles]
+    window = closes[-96:]
+    if len(window) < 2:
+        return window
+    step = max(1, len(window) // 24)
+    return window[::step][-24:]
 
 
 def sma(values: list[float], length: int) -> float | None:
@@ -295,6 +443,33 @@ def lecture(short: str, long: str) -> str:
     return "Pas de direction nette sur les deux horizons."
 
 
+_QUOTE_MARKS = (
+    ("USDT", "$"),
+    ("USDC", "$"),
+    ("USD", "$"),
+    ("EUR", "€"),
+    ("GBP", "£"),
+    ("JPY", "¥"),
+    ("CHF", "CHF"),
+    ("CAD", "CA$"),
+    ("AUD", "A$"),
+)
+
+
+def quote_mark(symbol: str) -> str:
+    text = symbol.upper()
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    for code, mark in _QUOTE_MARKS:
+        if text.endswith(code):
+            return mark
+    return text[-3:] if len(text) >= 3 else text
+
+
+def money(value: float, symbol: str) -> str:
+    return f"{fmt_price(value)} {quote_mark(symbol)}"
+
+
 def fmt_price(value: float) -> str:
     if value >= 10000:
         text = f"{value:,.0f}"
@@ -320,12 +495,36 @@ def side_label(side: str) -> str:
     return {"long": "LONG", "short": "SHORT", "neutre": "neutre"}.get(side, side)
 
 
-def notify(title: str, body: str, urgency: str = "normal", timeout_ms: int = 14000) -> None:
+def mark_unread() -> None:
+    UNREAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UNREAD_PATH.write_text(str(time.time()), encoding="utf-8")
+
+
+def clear_unread() -> None:
+    UNREAD_PATH.unlink(missing_ok=True)
+
+
+def notify(
+    title: str,
+    body: str,
+    urgency: str = "normal",
+    timeout_ms: int = 14000,
+    hold: bool = False,
+    state: dict | None = None,
+) -> None:
     line = f"{title} — {body.replace(chr(10), ' | ')}"
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with HISTORY_PATH.open("a", encoding="utf-8") as fh:
         fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + line + "\n")
     LOG.info("%s", line)
+    mark_unread()
+    if hold:
+        if state is not None:
+            pending = state.setdefault("pending", [])
+            pending.append({"title": title, "at": time.time()})
+            del pending[:-40]
+        LOG.info("notification retenue (heures silencieuses)")
+        return
     cmd = [
         "notify-send",
         "-a",
@@ -401,8 +600,8 @@ class Watcher:
             self.last_short = now
         if do_long and failures < len(self.settings.pairs):
             self.last_long = now
-        write_snapshot(snapshots)
         if not self.announce:
+            write_snapshot(snapshots, self.state, self.settings)
             return lines
         if snapshots and not self.started:
             last = float(self.state.get("announced_at") or 0)
@@ -414,7 +613,10 @@ class Watcher:
             self.started = True
         for snap in snapshots:
             self._price_alert(snap)
+            self._level_alert(snap)
             self._bias_alert(snap)
+        self._maybe_digest(snapshots)
+        write_snapshot(snapshots, self.state, self.settings)
         save_state(self.state)
         return lines
 
@@ -424,7 +626,9 @@ class Watcher:
         open_price = float(ticker.get("open") or 0)
         cached = self.cache.setdefault(pair.symbol, {})
         if do_short or "short" not in cached:
-            cached["short"] = short_bias(fetch_ohlc(self.settings, pair, 15))
+            short_candles = fetch_ohlc(self.settings, pair, 15)
+            cached["short"] = short_bias(short_candles)
+            cached["spark"] = sparkline(short_candles)
         if do_long or "long" not in cached:
             cached["long"] = long_bias(fetch_ohlc(self.settings, pair, 1440), price)
         else:
@@ -441,20 +645,26 @@ class Watcher:
             "low": float(ticker.get("low_24h") or 0),
             "short": cached["short"],
             "long": cached["long"],
+            "spark": list(cached.get("spark") or []),
         }
 
     def _format_line(self, snap: dict) -> str:
         pair: PairConfig = snap["pair"]
         day = fmt_pct(snap["day"]) if snap["day"] is not None else "n/a"
         return (
-            f"{pair.label} {fmt_price(snap['price'])} $ · 24h {day} · "
+            f"{pair.label} {money(snap['price'], pair.symbol)} · 24h {day} · "
             f"CT {side_label(snap['short'].side)} · LT {side_label(snap['long'].side)}"
         )
+
+    def _emit(self, title: str, body: str, urgency: str = "normal", timeout_ms: int = 14000, hold: bool | None = None) -> None:
+        if hold is None:
+            hold = in_quiet(self.settings)
+        notify(title, body, urgency=urgency, timeout_ms=timeout_ms, hold=hold, state=self.state)
 
     def _summary(self, snapshots: list[dict]) -> None:
         body = "\n".join(self._format_line(snap) for snap in snapshots)
         body += "\nAucun ordre n'est passé."
-        notify("Veille démarrée", body, urgency="low", timeout_ms=12000)
+        self._emit("Veille démarrée", body, urgency="low", timeout_ms=12000)
 
     def _price_alert(self, snap: dict) -> None:
         pair: PairConfig = snap["pair"]
@@ -474,12 +684,12 @@ class Watcher:
             return
         day = f" · 24h {fmt_pct(snap['day'])}" if snap["day"] is not None else ""
         body = (
-            f"{fmt_price(price)} $ · {fmt_pct(move)} depuis la dernière alerte{day}\n"
-            f"24h : {fmt_price(snap['low'])} – {fmt_price(snap['high'])} $\n"
+            f"{money(price, pair.symbol)} · {fmt_pct(move)} depuis la dernière alerte{day}\n"
+            f"24h : {money(snap['low'], pair.symbol)} – {money(snap['high'], pair.symbol)}\n"
             f"Court terme {side_label(snap['short'].side)} · "
             f"long terme {side_label(snap['long'].side)}"
         )
-        notify(
+        self._emit(
             f"{pair.label} · mouvement",
             body,
             urgency="critical" if urgent else "normal",
@@ -511,14 +721,68 @@ class Watcher:
             return
         day = f" · 24h {fmt_pct(snap['day'])}" if snap["day"] is not None else ""
         body = (
-            f"{fmt_price(snap['price'])} ${day}\n"
+            f"{money(snap['price'], pair.symbol)}{day}\n"
             f"Court terme : {side_label(short)} ({snap['short'].detail})\n"
             f"Long terme : {side_label(long)} ({snap['long'].detail})\n"
             f"{lecture(short, long)}"
         )
-        notify(f"{pair.label} · lecture", body, urgency="normal", timeout_ms=16000)
+        self._emit(f"{pair.label} · lecture", body, urgency="normal", timeout_ms=16000)
         slot["last_bias_alert"] = now
         self._store_bias(snap)
+
+    def _level_alert(self, snap: dict) -> None:
+        pair: PairConfig = snap["pair"]
+        price = float(snap["price"])
+        slot = pair_state(self.state, pair.symbol)
+        armed = slot.setdefault("armed_levels", {})
+        fired = slot.setdefault("fired_levels", {})
+        for kind, levels in (("below", pair.below), ("above", pair.above)):
+            for level in levels:
+                key = f"{kind}:{level:.8f}"
+                crossed = price <= level if kind == "below" else price >= level
+                if not crossed:
+                    armed[key] = True
+                    continue
+                if not armed.get(key) or fired.get(key):
+                    continue
+                word = "sous" if kind == "below" else "au-dessus de"
+                body = (
+                    f"{money(price, pair.symbol)} a passé {word} {money(level, pair.symbol)}\n"
+                    f"Seuil à usage unique. Change le montant dans la config pour le réarmer."
+                )
+                self._emit(f"{pair.label} · seuil", body, urgency="critical", timeout_ms=20000)
+                fired[key] = time.time()
+                armed[key] = False
+
+    def _maybe_digest(self, snapshots: list[dict]) -> None:
+        if self.settings.digest_minute is None or not snapshots:
+            return
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        minute = minutes_now(now)
+        target = self.settings.digest_minute
+        last_day = self.state.get("clock_day")
+        last_minute = self.state.get("clock_minute")
+        crossed = False
+        if last_day == today and last_minute is not None and last_minute < target <= minute:
+            crossed = True
+        elif last_day not in (None, today) and minute >= target:
+            crossed = True
+        self.state["clock_day"] = today
+        self.state["clock_minute"] = minute
+        if not crossed or self.state.get("digest_day") == today:
+            return
+        pending = list(self.state.get("pending") or [])
+        lines = [self._format_line(snap) for snap in snapshots]
+        body = "\n".join(lines)
+        if pending:
+            titles = "\n".join(f"· {item['title']}" for item in pending[-8:])
+            body += f"\nCette nuit :\n{titles}"
+        else:
+            body += "\nRien d'urgent pendant les heures silencieuses."
+        self._emit("Résumé du matin", body, urgency="normal", timeout_ms=20000, hold=False)
+        self.state["pending"] = []
+        self.state["digest_day"] = today
 
     def _store_bias(self, snap: dict) -> None:
         slot = pair_state(self.state, snap["pair"].symbol)
@@ -534,7 +798,7 @@ class Watcher:
             return
         if now - self.last_down_alert < 1800:
             return
-        notify(
+        self._emit(
             "Kraken injoignable",
             "La veille n'arrive plus à lire les prix. Nouvel essai automatique.",
             urgency="normal",
@@ -553,23 +817,50 @@ def long_bias_from_averages(price: float, fast: float, slow: float) -> Bias:
     return Bias(side, "prix face aux MM20 et MM50 journalières", fast=fast, slow=slow)
 
 
-def write_snapshot(snapshots: list[dict]) -> None:
+def write_snapshot(snapshots: list[dict], state: dict | None = None, settings: Settings | None = None) -> None:
     if not snapshots:
         return
-    payload = {"updated": time.time(), "pairs": [public_row(snap) for snap in snapshots]}
+    payload = {
+        "updated": time.time(),
+        "quiet": bool(settings and in_quiet(settings)),
+        "quiet_end": clock_label(settings.quiet_end) if settings else "",
+        "digest_hour": clock_label(settings.digest_minute) if settings else "",
+        "pending": len((state or {}).get("pending") or []),
+        "pairs": [public_row(snap, state or {}) for snap in snapshots],
+    }
     SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = SNAPSHOT_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SNAPSHOT_PATH)
 
 
-def public_row(snap: dict) -> dict:
+def level_rows(pair: PairConfig, state: dict) -> list[dict]:
+    slot = (state.get("pairs") or {}).get(pair.symbol) or {}
+    armed = slot.get("armed_levels") or {}
+    fired = slot.get("fired_levels") or {}
+    rows = []
+    for kind, levels in (("below", pair.below), ("above", pair.above)):
+        for level in levels:
+            key = f"{kind}:{level:.8f}"
+            rows.append(
+                {
+                    "side": kind,
+                    "price": fmt_price(level),
+                    "armed": bool(armed.get(key)),
+                    "fired": bool(fired.get(key)),
+                }
+            )
+    return rows
+
+
+def public_row(snap: dict, state: dict | None = None) -> dict:
     pair: PairConfig = snap["pair"]
     day = snap["day"]
     return {
         "symbol": pair.symbol,
         "label": pair.label,
         "market": market_name(pair),
+        "unit": quote_mark(pair.symbol),
         "price": fmt_price(snap["price"]),
         "day": fmt_pct(day) if day is not None else "n/a",
         "day_value": day,
@@ -580,6 +871,8 @@ def public_row(snap: dict) -> dict:
         "short_detail": snap["short"].detail,
         "long_detail": snap["long"].detail,
         "lecture": lecture(snap["short"].side, snap["long"].side),
+        "spark": [float(value) for value in snap.get("spark") or []],
+        "levels": level_rows(pair, state or {}),
     }
 
 
@@ -624,9 +917,10 @@ def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "run"
     if cmd in {"-h", "--help", "help"}:
         print(
-            "Usage : kraken-alerts [run|panel|check|rules]\n"
+            "Usage : kraken-alerts [run|panel|tray|check|rules]\n"
             "  run    veille permanente (défaut)\n"
             "  panel  fenêtre de récapitulatif\n"
+            "  tray   icône dans la barre\n"
             "  check  une lecture immédiate, sans notification\n"
             "  rules  explique les règles\n"
             f"Config : {CONFIG_PATH}"
@@ -642,6 +936,10 @@ def main(argv: list[str]) -> int:
         from panel import run_panel
 
         return run_panel()
+    if cmd == "tray":
+        from tray import run_tray
+
+        return run_tray()
     if cmd == "check":
         return cmd_check(settings)
     if cmd == "run":

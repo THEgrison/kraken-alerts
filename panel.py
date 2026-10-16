@@ -14,7 +14,16 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
-from kraken_alerts import SNAPSHOT_PATH, Watcher, load_settings, load_state, side_label
+from kraken_alerts import (
+    HISTORY_PATH,
+    SNAPSHOT_PATH,
+    Watcher,
+    clear_unread,
+    load_settings,
+    load_state,
+    quote_mark,
+    side_label,
+)
 
 ICON = Path.home() / ".local/share/icons/hicolor/48x48/apps/kraken-alerts.png"
 
@@ -68,16 +77,80 @@ def read_snapshot() -> tuple[str, dict | None]:
     return raw, data if isinstance(data, dict) else None
 
 
+class Sparkline(Gtk.DrawingArea):
+    def __init__(self, values: list[float], day_value):
+        super().__init__()
+        self.values = values
+        self.rising = not isinstance(day_value, (int, float)) or day_value >= 0
+        self.set_size_request(128, 36)
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, _widget, context) -> bool:
+        values = self.values
+        if len(values) < 2:
+            return False
+        width = self.get_allocated_width()
+        height = self.get_allocated_height()
+        low = min(values)
+        high = max(values)
+        span = high - low or 1.0
+        if self.rising:
+            context.set_source_rgb(0.12, 0.54, 0.30)
+        else:
+            context.set_source_rgb(0.82, 0.26, 0.26)
+        context.set_line_width(1.8)
+        for index, value in enumerate(values):
+            x = 2 + index / (len(values) - 1) * max(1, width - 4)
+            y = height - 3 - (value - low) / span * max(1, height - 6)
+            if index == 0:
+                context.move_to(x, y)
+            else:
+                context.line_to(x, y)
+        context.stroke()
+        return False
+
+
+def read_history() -> str:
+    try:
+        return HISTORY_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def short_alert(line: str) -> str:
+    if " — " in line:
+        return line.split(" — ", 1)[0]
+    return line
+
+
+def level_text(levels: list[dict], unit: str) -> str:
+    parts = []
+    for level in levels:
+        word = "sous" if level.get("side") == "below" else "au-dessus de"
+        if level.get("fired"):
+            state = "atteint"
+        elif level.get("armed"):
+            state = "armé"
+        else:
+            state = "en attente"
+        parts.append(f"{word} {level.get('price')} {unit} ({state})")
+    if not parts:
+        return ""
+    return "Seuils · " + " · ".join(parts)
+
+
 class Panel(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app, title="Alertes Kraken")
-        self.set_default_size(620, 640)
+        self.set_default_size(680, 760)
         self.set_position(Gtk.WindowPosition.CENTER)
         if ICON.exists():
             self.set_icon_from_file(str(ICON))
 
         self.raw = ""
+        self.history_raw = ""
         self.busy = False
+        clear_unread()
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         root.set_border_width(16)
@@ -96,9 +169,10 @@ class Panel(Gtk.ApplicationWindow):
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_overlay_scrolling(False)
         scrolled.set_vexpand(True)
         scrolled.set_propagate_natural_height(True)
-        scrolled.set_max_content_height(520)
+        scrolled.set_max_content_height(620)
         self.cards = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         scrolled.add(self.cards)
 
@@ -146,9 +220,11 @@ class Panel(Gtk.ApplicationWindow):
 
     def poll(self) -> bool:
         raw, data = read_snapshot()
+        history = read_history()
         self.update_status(data)
-        if raw != self.raw:
+        if raw != self.raw or history != self.history_raw:
             self.raw = raw
+            self.history_raw = history
             self.render(data)
         return True
 
@@ -164,7 +240,14 @@ class Panel(Gtk.ApplicationWindow):
         if time.time() - float(data["updated"]) > 180:
             late = " · lecture en retard"
         count = len(data.get("pairs") or [])
-        self.status.set_text(f"{active} · {count} suivis · {market_text} · mis à jour à {stamp}{late}")
+        quiet = ""
+        if data.get("quiet"):
+            quiet = f" · silencieux jusqu'à {data.get('quiet_end') or ''}"
+            if data.get("pending"):
+                quiet += f" · {data['pending']} en attente"
+        self.status.set_text(
+            f"{active} · {count} suivis · {market_text} · mis à jour à {stamp}{late}{quiet}"
+        )
 
     def render(self, data: dict | None) -> None:
         for child in self.cards.get_children():
@@ -178,6 +261,7 @@ class Panel(Gtk.ApplicationWindow):
             return
         for row in rows:
             self.cards.pack_start(self.card(row), False, False, 0)
+        self.cards.pack_start(self.history_box(), False, False, 0)
         self.cards.show_all()
 
     def card(self, row: dict) -> Gtk.Box:
@@ -201,9 +285,9 @@ class Panel(Gtk.ApplicationWindow):
         head.pack_start(badge, False, False, 0)
 
         price_row = Gtk.Box(spacing=12)
-        price = Gtk.Label(label=f"{row.get('price')} $", xalign=0)
+        unit = row.get("unit") or quote_mark(str(row.get("symbol") or ""))
+        price = Gtk.Label(label=f"{row.get('price')} {unit}", xalign=0)
         price.get_style_context().add_class("price")
-        price.set_hexpand(True)
         day = Gtk.Label(label=str(row.get("day") or ""), xalign=1)
         day_value = row.get("day_value")
         if isinstance(day_value, (int, float)) and day_value > 0.05:
@@ -212,7 +296,13 @@ class Panel(Gtk.ApplicationWindow):
             day.get_style_context().add_class("down")
         else:
             day.get_style_context().add_class("flat")
-        price_row.pack_start(price, True, True, 0)
+        spark_values = [float(value) for value in row.get("spark") or []]
+        price.set_hexpand(len(spark_values) < 2)
+        if len(spark_values) >= 2:
+            price_row.pack_start(price, False, False, 0)
+            price_row.pack_start(Sparkline(spark_values, day_value), True, True, 0)
+        else:
+            price_row.pack_start(price, True, True, 0)
         price_row.pack_end(day, False, False, 0)
 
         grid = Gtk.Grid(column_spacing=10, row_spacing=4)
@@ -225,7 +315,7 @@ class Panel(Gtk.ApplicationWindow):
         lecture.get_style_context().add_class("detail")
 
         span = Gtk.Label(
-            label=f"Fourchette 24 h · {row.get('low')} $ – {row.get('high')} $",
+            label=f"Fourchette 24 h · {row.get('low')} {unit} – {row.get('high')} {unit}",
             xalign=0,
         )
         span.get_style_context().add_class("muted")
@@ -235,6 +325,30 @@ class Panel(Gtk.ApplicationWindow):
         box.pack_start(grid, False, False, 0)
         box.pack_start(lecture, False, False, 0)
         box.pack_start(span, False, False, 0)
+        levels = level_text(row.get("levels") or [], unit)
+        if levels:
+            level_label = Gtk.Label(label=levels, xalign=0)
+            level_label.set_line_wrap(True)
+            level_label.get_style_context().add_class("muted")
+            box.pack_start(level_label, False, False, 0)
+        return box
+
+    def history_box(self) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title = Gtk.Label(label="Dernières alertes", xalign=0)
+        title.get_style_context().add_class("name")
+        box.pack_start(title, False, False, 0)
+        lines = [line for line in self.history_raw.splitlines() if line.strip()]
+        if not lines:
+            empty = Gtk.Label(label="Aucune alerte pour l'instant.", xalign=0)
+            empty.get_style_context().add_class("muted")
+            box.pack_start(empty, False, False, 0)
+            return box
+        for line in lines[-6:]:
+            label = Gtk.Label(label=short_alert(line), xalign=0)
+            label.set_line_wrap(True)
+            label.get_style_context().add_class("detail")
+            box.pack_start(label, False, False, 0)
         return box
 
     def bias_line(self, grid: Gtk.Grid, row: int, horizon: str, side: str, detail: str) -> None:
